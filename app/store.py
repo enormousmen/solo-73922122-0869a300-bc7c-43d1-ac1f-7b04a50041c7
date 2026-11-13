@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Sequence
 
 from .config import settings
-from .db import read_tx, write_tx
+from .db import new_lineage, read_tx, write_tx
 from .geometry import assemble as _assemble
 from .schemas import BatchIn, BatchResult, PointIn, RoadOut
 
@@ -278,6 +278,9 @@ def _apply(
                 "updated_at = ? WHERE id = ?",
                 (geom_text, missing_text, revision, stamp, road.road_id),
             )
+            lineage = conn.execute(
+                "SELECT lineage FROM roads WHERE id = ?", (road.road_id,)
+            ).fetchone()[0]
             stored_refs = [
                 r["point_id"]
                 for r in conn.execute(
@@ -289,10 +292,11 @@ def _apply(
         else:
             new_roads += 1
             revision = 1
+            lineage = new_lineage()
             conn.execute(
-                "INSERT INTO roads(id, geometry, missing_point_ids, revision, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (road.road_id, geom_text, missing_text, revision, stamp),
+                "INSERT INTO roads(id, geometry, missing_point_ids, revision, "
+                "updated_at, lineage) VALUES (?, ?, ?, ?, ?, ?)",
+                (road.road_id, geom_text, missing_text, revision, stamp, lineage),
             )
             write_refs(conn, road.road_id, [], road.point_ids)
         out.append(
@@ -303,6 +307,7 @@ def _apply(
                 geometry=road.geometry,
                 missing_point_ids=road.missing,
                 revision=revision,
+                lineage=lineage,
                 updated_at=stamp,
             )
         )
@@ -393,12 +398,12 @@ def get_point(conn, point_id: str) -> PointIn | None:
 def list_roads(conn, road_id: str | None = None) -> list[RoadOut]:
     if road_id is None:
         rows = conn.execute(
-            "SELECT id, geometry, missing_point_ids, revision, updated_at FROM roads "
+            "SELECT id, geometry, missing_point_ids, revision, lineage, updated_at FROM roads "
             "ORDER BY id"
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id, geometry, missing_point_ids, revision, updated_at FROM roads "
+            "SELECT id, geometry, missing_point_ids, revision, lineage, updated_at FROM roads "
             "WHERE id = ?",
             (road_id,),
         ).fetchall()
@@ -424,6 +429,7 @@ def list_roads(conn, road_id: str | None = None) -> list[RoadOut]:
                 geometry=geometry,
                 missing_point_ids=json.loads(row["missing_point_ids"]),
                 revision=row["revision"],
+                lineage=row["lineage"],
                 updated_at=row["updated_at"],
             )
         )

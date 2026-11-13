@@ -10,7 +10,11 @@ a black-box acceptance check of the delivered environment:
 5. a deliberately paused batch on A (assembly outside any write lock) runs
    while B keeps ingesting and repointing roads;
 6. a failed batch rolls back; the final state is then re-read from B, and
-   snapshots are validated against the persisted values.
+   snapshots are validated against the persisted values;
+7. topology check: transverse interior intersections are reported with both
+   road ids and segment indices, endpoint contact is ignored;
+8. a QC verdict confirms an overpass on A; B changing the bound road makes the
+   stale confirmation fail with 409, and a fresh re-check re-confirms it.
 
 Run locally::
 
@@ -59,6 +63,19 @@ class Api:
 
     def state(self) -> dict:
         r = self.http.get("/api/v1/state")
+        r.raise_for_status()
+        return r.json()
+
+    def topo_check(self, road_ids: list[str]) -> dict:
+        r = self.http.post("/api/v1/topology/checks", json={"road_ids": road_ids})
+        r.raise_for_status()
+        return r.json()
+
+    def verdict(self, body: dict):
+        return self.http.post("/api/v1/topology/verdicts", json=body)
+
+    def verdicts(self, **params) -> dict:
+        r = self.http.get("/api/v1/topology/verdicts", params=params)
         r.raise_for_status()
         return r.json()
 
@@ -165,6 +182,9 @@ def _run(args) -> None:
     # consistency check on the whole snapshot
     coords = {p["id"]: [p["lon"], p["lat"]] for p in after["points"]}
     for road in after["roads"]:
+        if road["geometry"] is None:
+            # incomplete roads carry no partial line by design
+            continue
         for pid, pos in zip(road["point_ids"], road["geometry"]["coordinates"]):
             assert pos == coords[pid], f"{road['id']} geometry does not match point {pid}"
 
@@ -179,7 +199,121 @@ def _run(args) -> None:
             },
         },
     )
-    print("\n演示完成。重启 api-a / api-b 后上述数据仍在（SQLite WAL 持久化）。")
+
+    # -- 7 --------------------------------------------------------------
+    # Dedicated topology fixtures: TOPO-1 and TOPO-2 cross transversely in
+    # their segment interiors; TOPO-3 only shares an endpoint with TOPO-1
+    # (must be ignored); TOPO-X references a missing point (unchecked).
+    topo_points = [
+        {"id": "TP-1", "lon": 116.5000, "lat": 39.9000},
+        {"id": "TP-2", "lon": 116.5400, "lat": 39.9400},
+        {"id": "TP-3", "lon": 116.5000, "lat": 39.9400},
+        {"id": "TP-4", "lon": 116.5400, "lat": 39.9000},
+        {"id": "TP-5", "lon": 116.5600, "lat": 39.9600},
+    ]
+    topo_roads = [
+        {"id": "TOPO-1", "point_ids": ["TP-1", "TP-2"]},
+        {"id": "TOPO-2", "point_ids": ["TP-3", "TP-4"]},
+        {"id": "TOPO-3", "point_ids": ["TP-2", "TP-5"]},  # endpoint contact only
+        {"id": "TOPO-X", "point_ids": ["TP-1", "TP-GONE"]},  # incomplete
+    ]
+    a.batch({"points": topo_points, "roads": topo_roads})
+
+    check = a.topo_check(["TOPO-1", "TOPO-2", "TOPO-3", "TOPO-X", "TOPO-GHOST"])
+    pretty(
+        "7. 拓扑核查：横向内部交点 + 双方 ID/线段序号；端点接触忽略、缺点/未知列未核查",
+        check,
+    )
+    assert check["total"] == 1, check
+    hit = check["intersections"][0]
+    assert hit["road_a_id"] == "TOPO-1" and hit["road_b_id"] == "TOPO-2"
+    assert hit["road_a_segment"] == 0 and hit["road_b_segment"] == 0
+    # On a pristine database the intersection starts unreviewed; on a repeated
+    # demo run it may already carry the verdict from a previous run.
+    print("交点当前裁决状态:", hit["review_status"])
+    unchecked = {u["road_id"]: u["reason"] for u in check["unchecked_roads"]}
+    assert unchecked == {"TOPO-X": "incomplete", "TOPO-GHOST": "unknown_id"}
+
+    # -- 8 --------------------------------------------------------------
+    roads_now = {r["id"]: r for r in a.state()["roads"]}
+
+    def binding(side: str) -> dict:
+        return {
+            "road_id": hit[f"road_{side}_id"],
+            "segment": hit[f"road_{side}_segment"],
+            "lineage": roads_now[hit[f"road_{side}_id"]]["lineage"],
+            "revision": roads_now[hit[f"road_{side}_id"]]["revision"],
+        }
+
+    verdict_body = {
+        "road_a": binding("a"),
+        "road_b": binding("b"),
+        "status": "confirmed",
+        "reason": "现场复核为跨线桥，垂直净距 5.2m，确认无平面冲突",
+    }
+    confirmed = a.verdict(verdict_body)
+    confirmed.raise_for_status()
+    pretty("8a. 确认立交（API A）：裁决绑定双方 lineage/revision", confirmed.json())
+
+    recheck = a.topo_check(["TOPO-1", "TOPO-2"])
+    assert recheck["intersections"][0]["review_status"] == "confirmed"
+    pretty("再次核查：该交点状态变为 confirmed，携带有效裁决", recheck)
+
+    # B moves a survey point of the bound road while A holds the old binding.
+    moved = b.batch(
+        {"points": [{"id": "TP-1", "lon": 116.5004, "lat": 39.9002}]}
+    )
+    pretty("8b. 确认期间 API B 改线：TOPO-1 revision 前进，旧裁决失效", {
+        "affected": moved["affected_road_ids"],
+        "TOPO-1": next(r for r in moved["roads"] if r["id"] == "TOPO-1"),
+    })
+
+    stale = a.verdict(verdict_body)
+    pretty("用旧绑定再次确认 -> 409，且不产生任何裁决", stale.json())
+    assert stale.status_code == 409
+
+    # Reverting to the original coordinate must NOT revive the old verdict.
+    b.batch({"points": [{"id": "TP-1", "lon": 116.5000, "lat": 39.9000}]})
+    still_stale = a.verdict(verdict_body)
+    assert still_stale.status_code == 409
+    listed = a.verdicts()
+    assert listed["verdicts"][0]["valid"] is False
+    pretty("改回原值后旧裁决仍失效（revision 已前进）", {
+        "verdict_id": listed["verdicts"][0]["id"],
+        "valid": listed["verdicts"][0]["valid"],
+    })
+
+    # A fresh check returns the new binding; the old verdict is invalid, so the
+    # intersection is presented for review again. Re-confirming succeeds.
+    fresh_check = a.topo_check(["TOPO-1", "TOPO-2"])
+    fresh_hit = fresh_check["intersections"][0]
+    assert fresh_hit["verdict"] is None or fresh_hit["verdict"]["valid"] is False
+    fresh_roads = {r["id"]: r for r in a.state()["roads"]}
+
+    def fresh_binding(side: str) -> dict:
+        return {
+            "road_id": fresh_hit[f"road_{side}_id"],
+            "segment": fresh_hit[f"road_{side}_segment"],
+            "lineage": fresh_roads[fresh_hit[f"road_{side}_id"]]["lineage"],
+            "revision": fresh_roads[fresh_hit[f"road_{side}_id"]]["revision"],
+        }
+
+    reconfirmed = a.verdict(
+        {
+            "road_a": fresh_binding("a"),
+            "road_b": fresh_binding("b"),
+            "status": "confirmed",
+            "reason": "改线后重新复核，维持立交结论",
+        }
+    )
+    reconfirmed.raise_for_status()
+    pretty("按新线形重新核查并确认 -> 201，裁决重新有效", reconfirmed.json())
+    assert a.verdicts(status="confirmed")["total"] == 1
+
+    print(
+        "\n演示完成。重启 api-a / api-b 后测点、线形与有效裁决均保留"
+        "（SQLite WAL 持久化）。"
+    )
 
 
 def main(argv=None) -> int:

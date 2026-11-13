@@ -17,6 +17,7 @@ Design notes
 """
 from __future__ import annotations
 
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -36,7 +37,11 @@ CREATE TABLE IF NOT EXISTS roads (
     geometry          TEXT,             -- materialised GeoJSON LineString, NULL = incomplete
     missing_point_ids TEXT NOT NULL DEFAULT '[]',
     revision          INTEGER NOT NULL DEFAULT 0,
-    updated_at        TEXT NOT NULL
+    updated_at        TEXT NOT NULL,
+    -- identity of the *current incarnation* of this road id; a delete followed
+    -- by a recreate-with-same-id gets a fresh lineage, so old verdicts can
+    -- never be inherited
+    lineage           TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS road_points (
@@ -56,7 +61,56 @@ CREATE TABLE IF NOT EXISTS store_meta (
     generation  INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO store_meta(id, generation) VALUES (1, 0);
+
+-- QC verdicts on observed intersections.  A verdict binds the exact two road
+-- incarnations (lineage + revision) that were seen at check time; any change
+-- to either road's coordinates or references makes it invalid.  Rows are kept
+-- after invalidation (they never silently mutate), and re-confirming the same
+-- intersection writes a fresh verdict.  No foreign keys: a deleted road must
+-- leave its history behind and simply count as "the road changed".
+CREATE TABLE IF NOT EXISTS topology_verdicts (
+    id                  TEXT PRIMARY KEY,
+    road_a_id           TEXT NOT NULL,
+    road_a_segment      INTEGER NOT NULL,
+    road_b_id           TEXT NOT NULL,
+    road_b_segment      INTEGER NOT NULL,
+    road_a_lineage      TEXT NOT NULL,
+    road_b_lineage      TEXT NOT NULL,
+    road_a_revision     INTEGER NOT NULL,
+    road_b_revision     INTEGER NOT NULL,
+    intersection_point  TEXT NOT NULL,       -- [lon, lat] seen when confirmed
+    status              TEXT NOT NULL,       -- confirmed | pending_review
+    reason              TEXT NOT NULL DEFAULT '',
+    generation          INTEGER NOT NULL,    -- committed state the verdict binds
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    UNIQUE (road_a_id, road_a_segment, road_b_id, road_b_segment)
+);
+CREATE INDEX IF NOT EXISTS idx_verdicts_pair
+    ON topology_verdicts(road_a_id, road_b_id);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Upgrade databases created before the topology feature existed."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(roads)")}
+    if "lineage" not in cols:
+        conn.execute("ALTER TABLE roads ADD COLUMN lineage TEXT")
+        rows = conn.execute("SELECT id FROM roads").fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE roads SET lineage = ? WHERE id = ?",
+                (secrets.token_hex(8), row["id"]),
+            )
+    conn.execute(
+        "UPDATE roads SET lineage = ? WHERE lineage IS NULL OR lineage = ''",
+        (secrets.token_hex(8),),
+    )
+
+
+def new_lineage() -> str:
+    """Incarnation id: regenerated on every road (re)creation."""
+    return secrets.token_hex(8)
 
 
 def _connect() -> sqlite3.Connection:
@@ -80,7 +134,16 @@ def init_db() -> None:
         conn = _connect()
         try:
             conn.execute("PRAGMA journal_mode = WAL")
+            # executescript implicitly commits first; keep DDL idempotent and
+            # do the guarded migration in its own serialised transaction.
             conn.executescript(SCHEMA)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _migrate(conn)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
             return
         except sqlite3.OperationalError as exc:  # pragma: no cover - startup race
             last = exc
